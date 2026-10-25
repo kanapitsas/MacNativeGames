@@ -4,6 +4,7 @@
 #import <UIKit/UIKit.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
+#import <CoreMotion/CoreMotion.h>
 #include <stdatomic.h>
 #include "runtime.h"
 #include "totk_ui_lang.h"
@@ -85,6 +86,42 @@ static void app_active_changed(int active){
 void runtime_front_request_close(void){fprintf(stderr,"[totk] close requested; iOS apps are closed by the user\n");}
 void runtime_front_text_test(const char *op,const char *text){(void)text;fprintf(stderr,"[totk] text entry test \"%s\" ignored: iOS has no text entry bar (the keyboard request is cancelled)\n",op?op:"");}
 
+/* The phone's own motion sensor as the handheld console's six-axis sensor, for motion aiming without a controller
+   (TOTK_GYRO, on unless =0, also the Settings app's switch; the game's own option for motion controls must be on too).
+   CoreMotion's device frame is the portrait one (x right, y toward the top edge, z out of the screen; gravity counted as
+   acceleration, face up z = -1 G, as GCMotion and the Switch read it): it is turned to the landscape screen the game is
+   shown on. Landscape left has the phone's top edge on the right, landscape right on the left. */
+static CMMotionManager *motionManager;
+static _Atomic int landscapeSign=1;   /* +1 landscape left, -1 landscape right */
+static void motion_orientation(UIView *host){
+ UIWindowScene *scene=host.window.windowScene;if(!scene)return;
+ atomic_store(&landscapeSign,scene.interfaceOrientation==UIInterfaceOrientationLandscapeRight?-1:1);
+}
+static void motion_start(UIView *host){
+ if(!runtime_gyro_enabled())return;
+ /* turning the phone over to the other landscape keeps the view's size, so no layout tells it: the scene has its new
+    orientation once the rotation has run */
+ __weak UIView *weakHost=host;
+ [[UIDevice currentDevice] beginGeneratingDeviceOrientationNotifications];
+ [NSNotificationCenter.defaultCenter addObserverForName:UIDeviceOrientationDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n){
+  (void)n;dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(0.5*NSEC_PER_SEC)),dispatch_get_main_queue(),^{UIView *h=weakHost;if(h)motion_orientation(h);});
+ }];
+ motionManager=[CMMotionManager new];
+ if(!motionManager.deviceMotionAvailable){fprintf(stderr,"[gyro] no device motion here\n");motionManager=nil;return;}
+ motionManager.deviceMotionUpdateInterval=1.0/100;
+ NSOperationQueue *queue=[NSOperationQueue new];queue.maxConcurrentOperationCount=1;queue.qualityOfService=NSQualityOfServiceUserInteractive;
+ [motionManager startDeviceMotionUpdatesToQueue:queue withHandler:^(CMDeviceMotion *m,NSError *error){
+  if(!m||error)return;
+  double s=atomic_load(&landscapeSign);
+  CMAcceleration g=m.gravity,u=m.userAcceleration;CMRotationRate r=m.rotationRate;
+  /* screen x = s * device y, screen y = -s * device x: a rotation in the screen's plane, so the rotation rates turn alike */
+  double acc[3]={s*(g.y+u.y),-s*(g.x+u.x),g.z+u.z},gyro[3]={s*r.y,-s*r.x,r.z};
+  runtime_motion_feed(acc,gyro,runtime_now_ns());
+ }];
+ runtime_motion_live(1);
+ fprintf(stderr,"[gyro] the phone's motion sensor is the six-axis sensor (100 Hz; TOTK_GYRO=0 or the Settings app turns it off)\n");
+}
+
 @interface TOTKVsync:NSObject
 @end
 @implementation TOTKVsync
@@ -101,6 +138,7 @@ void runtime_ios_sync_drawable(UIView *host){
  CGFloat s=host.window.screen.nativeScale>0?host.window.screen.nativeScale:UIScreen.mainScreen.nativeScale;
 #endif
  metalLayer.contentsScale=s;
+ motion_orientation(host);   /* layout runs again when the phone turns to the other landscape */
  /* TOTK_IOS_DRAWABLE_H (default 720; 0 = native pixels): build the drawable this many pixels tall at the view's aspect, so the
     game picture (1280x720 canvas) lands about 1:1 and the system compositor scales it to the screen instead of our GPU. */
  double vw=round(host.bounds.size.width*s),vh=round(host.bounds.size.height*s);
@@ -143,6 +181,7 @@ void runtime_ios_attach_layer(CAMetalLayer *layer,UIView *host){
  [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n){(void)n;app_active_changed(1);}];
  vsyncTarget=[TOTKVsync new];displayLink=[CADisplayLink displayLinkWithTarget:vsyncTarget selector:@selector(tick:)];
  displayLink.preferredFrameRateRange=CAFrameRateRangeMake(60,60,60);[displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+ motion_start(host);
 }
 /* The app already runs the loader on a game thread with a large stack; the event loop belongs to UIKit. */
 void runtime_front_run(void(*callback)(void)){

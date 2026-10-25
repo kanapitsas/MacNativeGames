@@ -282,6 +282,9 @@ static void audio_observe(void) {
     // the value must be applied here. overwrite=0 keeps devicectl --environment-variables winning when testing from the Mac.
     NSString *lang = [NSUserDefaults.standardUserDefaults stringForKey:@"TOTK_LANG"];
     if (lang.length>0&&lang.length<8) setenv("TOTK_LANG",lang.UTF8String,0);
+    // Motion aiming with the phone's own sensor (runtime/frontend_ios.m): Settings.bundle › TOTK_GYRO, on unless switched off.
+    id gyro = [NSUserDefaults.standardUserDefaults objectForKey:@"TOTK_GYRO"];
+    if (gyro && ![gyro boolValue]) setenv("TOTK_GYRO","0",0);
     setenv("TOTK_ROMFS_PATCHES",[res stringByAppendingPathComponent:@"romfs-patches"].fileSystemRepresentation,1);
     setenv("TOTK_ROMFS_PATCHES_OUT",[res stringByAppendingPathComponent:@"romfs-patches-out"].fileSystemRepresentation,1);
     setenv("TOTK_SHARED_FONTS",[res stringByAppendingPathComponent:@"shared-fonts"].fileSystemRepresentation,1);
