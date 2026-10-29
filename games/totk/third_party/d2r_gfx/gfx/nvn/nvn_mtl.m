@@ -8764,42 +8764,60 @@ static void warm_fill_archive(NSArray<NSString *> *paths, dispatch_semaphore_t d
         atomic_store(&par_filling, 1); par_write_in_place = 1;
         NSMutableDictionary<NSString *, NvShader *> *dict = [NSMutableDictionary dictionary];
         MLOG("管线存档：后台填充开始（%lu 份管线清单，每条建完写成自己的文件就丢）", (unsigned long)paths.count);
-        for (NSString *path in paths) {
+        /* Packaging (done set): rows on warm_threads() threads, as warm_build_rows does at a start (2026-10-29): one after another the packaging
+           kept one Metal compiler busy (TOTK 1.4.3, ~69,000 rows, 76 % of one core). Each thread fills its own archive
+           batch (par_write_in_place, par_flush_thread are per thread); warm_shader locks the shared dict. */
+        NSMutableArray<NSString *> *todo = [NSMutableArray array];
+        for (NSString *path in paths) @autoreleasepool {
             NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
-            for (NSString *line in [txt componentsSeparatedByString:@"\n"]) @autoreleasepool {
+            for (NSString *line in [txt componentsSeparatedByString:@"\n"]) {
                 if (!line.length || [line hasPrefix:@"#"] || [seen containsObject:line]) continue;
-                [seen addObject:line];
+                [seen addObject:line]; [todo addObject:line];
+            }
+        }
+        __block _Atomic uint64_t a_nr = 0, a_nc = 0, a_fail = 0, a_have = 0, a_at = 0; __block _Atomic size_t next = 0;
+        size_t n = todo.count, workers = done ? (size_t)warm_threads() : 1; if (workers < 1) workers = 1;   /* the device's own background fill stays on one thread */ if (workers > n) workers = n ? n : 1;
+        int wip = par_write_in_place;
+        dispatch_apply(workers, dispatch_get_global_queue(done ? QOS_CLASS_USER_INITIATED : QOS_CLASS_BACKGROUND, 0), ^(size_t w) {
+            int owip = par_write_in_place; par_write_in_place = wip; (void)w;
+            for (;;) @autoreleasepool {
+                size_t i = atomic_fetch_add(&next, 1); if (i >= n) break;
+                NSString *line = todo[i];
                 NSArray<NSString *> *c = [line componentsSeparatedByString:@"\t"];
                 id ps = nil; int tried = 0;
-                if (([c[0] isEqualToString:@"R"] || [c[0] isEqualToString:@"C"] || [c[0] isEqualToString:@"B"] || [c[0] isEqualToString:@"T"]) && done && runtime_warm_progress && !(++at % 32)) runtime_warm_progress(at, rows, 0, 0, at, rows);
+                if (([c[0] isEqualToString:@"R"] || [c[0] isEqualToString:@"C"] || [c[0] isEqualToString:@"B"] || [c[0] isEqualToString:@"T"]) && done && runtime_warm_progress) {
+                    uint64_t k = atomic_fetch_add(&a_at, 1) + 1; if (!(k % 32)) runtime_warm_progress(k, rows, 0, 0, k, rows);
+                }
                 if ([c[0] isEqualToString:@"R"] && c.count >= 2) {
                     pso_skey sk; if (pso_skey_parse(c[1].UTF8String, &sk) || sk.fz) continue;
                     /* already in the archive: nothing to make (the key pso_archive_key gives a warm-built one: no fragment
                        state description); a start then reads the list without loading a shader */
                     pso_skey ak = sk; memset(&ak.fz_desc, 0, sizeof ak.fz_desc);
                     pthread_mutex_lock(&g_par_mu); BOOL have = [g_par_have containsObject:par_hash(&ak, sizeof ak)]; pthread_mutex_unlock(&g_par_mu);
-                    if (have) { nhave++; continue; }
+                    if (have) { atomic_fetch_add(&a_have, 1); continue; }
                     NSString *vkey = warm_key(sk.vs, sizeof sk.vs), *fkey = warm_key(sk.fs, sizeof sk.fs);
                     NvShader *vs = vkey.length ? warm_shader(dict, vkey, sk.vs_stage) : nil, *fs = fkey.length ? warm_shader(dict, fkey, sk.fs_stage) : nil;
-                    if (!vs || (fkey.length && !fs)) { nfail++; continue; }
+                    if (!vs || (fkey.length && !fs)) { atomic_fetch_add(&a_fail, 1); continue; }
                     pso_key k = sk.k; k.vs = (__bridge void *)vs; k.fs = (__bridge void *)fs; k.fsfn = NULL;
-                    NSError *er = nil; ps = pso_new(pso_desc(&k, vs, fs, nil, sk.merged), pso_archive_key(&k, vs, fs, sk.merged, nil), &er); tried = 1; nr += ps != nil;
+                    NSError *er = nil; ps = pso_new(pso_desc(&k, vs, fs, nil, sk.merged), pso_archive_key(&k, vs, fs, sk.merged, nil), &er); tried = 1; if (ps) atomic_fetch_add(&a_nr, 1);
                 } else if ([c[0] isEqualToString:@"C"] && c.count >= 2 && [c[1] length]) {
                     const char *ck = c[1].UTF8String;
                     pthread_mutex_lock(&g_par_mu); BOOL have = [g_par_have containsObject:[@"c" stringByAppendingString:par_hash(ck, strlen(ck))]]; pthread_mutex_unlock(&g_par_mu);
-                    if (have) { nhave++; continue; }
-                    NvShader *cs = warm_shader(dict, c[1], 5); if (!cs) { nfail++; continue; }
-                    NSError *er = nil; ps = cs_new(cs, &er); tried = 1; nc += ps != nil;
+                    if (have) { atomic_fetch_add(&a_have, 1); continue; }
+                    NvShader *cs = warm_shader(dict, c[1], 5); if (!cs) { atomic_fetch_add(&a_fail, 1); continue; }
+                    NSError *er = nil; ps = cs_new(cs, &er); tried = 1; if (ps) atomic_fetch_add(&a_nc, 1);
                 } else if (([c[0] isEqualToString:@"B"] && c.count >= 4) || ([c[0] isEqualToString:@"T"] && c.count >= 3)) {   // border and tile-read
                     // variants too, otherwise built in play (BotW 1.6.0: about 80 on a 5-minute route, 2026-10-28)
                     int r = [c[0] isEqualToString:@"B"] ? warm_border(c, dict, 0) : warm_tileread(c, dict, 0);
-                    if (r == 2) { nhave++; continue; }
-                    tried = 1; ps = r ? @YES : nil; nr += ps != nil;
+                    if (r == 2) { atomic_fetch_add(&a_have, 1); continue; }
+                    tried = 1; ps = r ? @YES : nil; if (ps) atomic_fetch_add(&a_nr, 1);
                 } else continue;
-                if (tried && !ps) nfail++;
-                if (dict.count > 256) [dict removeAllObjects];
+                if (tried && !ps) atomic_fetch_add(&a_fail, 1);
+                os_unfair_lock_lock(&g_warm_dict_lock); if (dict.count > 256) [dict removeAllObjects]; os_unfair_lock_unlock(&g_warm_dict_lock);
             }
-        }
+            par_flush_thread(); par_write_in_place = owip;
+        });
+        nr = a_nr; nc = a_nc; nfail = a_fail; nhave = a_have; at = a_at;
         [dict removeAllObjects];
         par_flush_thread(); atomic_store(&par_filling, 0); par_write_in_place = 0;
         g_fill_last.render = nr; g_fill_last.compute = nc; g_fill_last.have = nhave; g_fill_last.failed = nfail; g_fill_last.seconds = (bp_now() - t0) / 1e9;
